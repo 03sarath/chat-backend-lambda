@@ -1,6 +1,7 @@
 import boto3
 import json
 from datetime import datetime, timezone
+from botocore.exceptions import ClientError
 
 dynamodb = boto3.client('dynamodb')
 TABLE_CHAT_INFO = 'chat_information'
@@ -38,7 +39,9 @@ def lambda_handler(event, context):
         is_host = sender_conn.get('is_host', {}).get('BOOL', False)
         timestamp = datetime.now(timezone.utc).isoformat()
 
-        # Query for recipient in same session
+        print(f"Sender: {sender_id}, To: {to}, Session: {session_id}, Event: {event_id}")
+
+        # Query for recipient connection
         receiver_conn = dynamodb.query(
             TableName=TABLE_CONNECTIONS,
             IndexName='guest_id-session_id-index',
@@ -50,6 +53,7 @@ def lambda_handler(event, context):
         )
 
         if receiver_conn['Count'] == 0:
+            print(f"No connection found for guest_id={to} and session_id={session_id}")
             return {
                 'statusCode': 404,
                 'body': json.dumps({'error': 'Recipient not connected in same session'})
@@ -57,7 +61,24 @@ def lambda_handler(event, context):
 
         receiver_conn_id = receiver_conn['Items'][0]['connection_id']['S']
 
-        # Update chat history in Chat_information using sender's session_id + event_id
+        # Ensure chat_information record exists
+        try:
+            dynamodb.put_item(
+                TableName=TABLE_CHAT_INFO,
+                Item={
+                    'session_id': {'S': session_id},
+                    'event_id': {'S': event_id},
+                    'chat_history': {'L': []},
+                    'guest_id': {'S': sender_id}  # Optional
+                },
+                ConditionExpression='attribute_not_exists(session_id) AND attribute_not_exists(event_id)'
+            )
+            print(f"Created new chat_information record for session={session_id}, event={event_id}")
+        except ClientError as e:
+            if e.response['Error']['Code'] != 'ConditionalCheckFailedException':
+                raise
+
+        # Append message to chat_history
         dynamodb.update_item(
             TableName=TABLE_CHAT_INFO,
             Key={
@@ -70,7 +91,7 @@ def lambda_handler(event, context):
                     'M': {
                         'Timestamp': {'S': timestamp},
                         'Sender': {'S': sender_id},
-                        'Message': {'S': message} 
+                        'Message': {'S': message}
                     }
                 }]},
                 ':empty': {'L': []}
@@ -91,7 +112,6 @@ def lambda_handler(event, context):
                 }).encode('utf-8')
             )
         except apig.exceptions.GoneException:
-            # Recipient disconnected
             dynamodb.delete_item(
                 TableName=TABLE_CONNECTIONS,
                 Key={'connection_id': {'S': receiver_conn_id}}
